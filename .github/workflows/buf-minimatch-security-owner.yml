@@ -1,0 +1,95 @@
+name: Focused buf action security owner
+on:
+  push:
+    branches: [codex/buf-minimatch-security-owner-v2-20261105]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      REVIEWED_COMMIT: a150325972604d2251cfa62d5d8e8c30d44c059f
+      REVIEWED_TREE: f625be98d5af9c440ac23238e72aa1c70af6b3fe
+    steps:
+      - name: Check out reviewed source and diagnostic child
+        uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Authenticate exact reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$REVIEWED_COMMIT"
+          test "$(git rev-parse "$REVIEWED_COMMIT^{tree}")" = "$REVIEWED_TREE"
+          test "$(git diff --name-only "$REVIEWED_COMMIT" HEAD)" = '.github/workflows/buf-minimatch-security-owner.yml'
+          test -z "$(git status --porcelain)"
+          sha256sum -c <<'SHA256'
+          823db409417fe0cdf7ce0ba97c67c047da7c59c7958a44c13456963e01889fc8  package.json
+          5355cf0e4b0b5b7927912e5f1c2074387dddaba17a5aea1c0be49764566ab01c  package-lock.json
+          efabd8b0f2ae49944a4f01afb0852c393e3f94071492cc6f665c6e958c825b88  dist/main.js
+          62224ac6b8ef5d5cb05ca9188df70798489a5417b57e3d1de8197ca343f62759  dist/main.js.map
+          SHA256
+          mkdir -p "$RUNNER_TEMP/buf-security-owner"
+      - name: Install exact Node
+        uses: KirilsTurkins/lsf-setup-node@fdae00b14e855eb751452bc70c64dde286270415
+        with:
+          node-version: 24.19.0
+      - name: Install, lint and build exact lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v24.19.0'
+          test "$(npm --version)" = '11.17.0'
+          npm ci --no-audit --no-fund
+          npm ls --all > "$RUNNER_TEMP/buf-security-owner/npm-ls.txt"
+          npm run lint
+          npm run build
+          git diff --exit-code "$REVIEWED_COMMIT" -- package.json package-lock.json dist/main.js
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          before=json.loads(subprocess.check_output(['git','show',os.environ['REVIEWED_COMMIT']+':dist/main.js.map']))
+          after=json.loads(Path('dist/main.js.map').read_bytes())
+          a=before.pop('sourcesContent'); b=after.pop('sourcesContent')
+          assert before==after and len(a)==len(b)==len(before['sources'])
+          allowed={'../src/run.ts','../src/buf.ts','../src/error.ts','../src/main.ts'}
+          changed=[]
+          for name, old, new in zip(before['sources'],a,b):
+              if old != new:
+                  assert name in allowed and isinstance(old,str) and isinstance(new,str)
+                  assert old.replace('\r\n','\n')==new.replace('\r\n','\n')
+                  changed.append(name)
+          assert set(changed)<=allowed
+          Path(os.environ['RUNNER_TEMP'],'buf-security-owner','source-map.json').write_text(
+              json.dumps({'unchanged_fields':True,'line_ending_only_sources':changed},sort_keys=True)+'\n')
+          print('source map fields match; allowed source line endings:',len(changed))
+          PY
+          sha256sum dist/main.js dist/main.js.map > "$RUNNER_TEMP/buf-security-owner/bundle-sha256.txt"
+      - name: Check original matcher behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const assert=require('node:assert/strict')
+          const {createRequire}=require('node:module')
+          const fs=require('node:fs')
+          const path=require('node:path')
+          const req=createRequire(path.join(process.cwd(),'node_modules/@typescript-eslint/typescript-estree/package.json'))
+          const matcher=req('minimatch')
+          const cases=[{"input":"src/index.ts","pattern":"**/*.ts","result":true},{"input":"src/index.js","pattern":"**/*.ts","result":false},{"input":"a/b/c.ts","pattern":"a/**/*.ts","result":true},{"input":"a/.hidden.ts","pattern":"**/*.ts","result":false},{"input":"src/test.spec.ts","pattern":"**/*.spec.ts","result":true},{"input":"src/test.ts","pattern":"**/*.spec.ts","result":false},{"input":"foo.ts","pattern":"*.{ts,js}","result":true},{"input":"foo.js","pattern":"*.{ts,js}","result":true},{"input":"foo.json","pattern":"*.{ts,js}","result":false},{"input":"a/b.js","pattern":"a/?*.js","result":true},{"input":"a/b.txt","pattern":"a/?*.js","result":false},{"input":"src/lib/file.ts","pattern":"src/**/file.ts","result":true},{"input":"src/foo.ts","pattern":"!*.js","result":true},{"input":"foo.js","pattern":"!*.js","result":false},{"input":"a/b/c.ts","pattern":"a/*/c.ts","result":true},{"input":"a/b/d.ts","pattern":"a/*/c.ts","result":false},{"input":"foo.test.ts","pattern":"*.test.ts","result":true},{"input":"foo.ts","pattern":"*.test.ts","result":false},{"input":"a/b.ts","pattern":"**/*.@(ts|js)","result":true},{"input":"a/b.json","pattern":"**/*.@(ts|js)","result":false}]
+          for(const c of cases) assert.equal(matcher.minimatch(c.input,c.pattern),c.result,c.input+' '+c.pattern)
+          assert.equal(cases.length,20)
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'buf-security-owner','matcher.json'),JSON.stringify({cases:cases.length,passed:true})+'\n')
+          console.log('20 TypeScript parser matcher cases match the original')
+          NODE
+      - name: Retain focused evidence
+        if: always()
+        uses: KirilsTurkins/lsf-upload-artifact@5c42799caf30eda69cb2db5da0be2400c47cef16
+        with:
+          name: buf-security-owner-${{ github.run_id }}
+          path: ${{ runner.temp }}/buf-security-owner
+          if-no-files-found: warn
+          retention-days: 7
